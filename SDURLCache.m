@@ -272,12 +272,22 @@ static NSDate *_parseHTTPDate(const char *buf, size_t bufLen) {
     return(date);
 }
 
+@interface SDCachedURLResponse : NSCachedURLResponse
+/*
+ * NSCachedURLResponse NSCoding is buggy (at least on iOS 5.1): it doesn't properly encode NSCachedURLResponse.data, it always encodes nil instead.
+ * This subclass is therefore used instead of NSCachedURLResponse in order to fix this bug.
+ * To use it for encoding, an instance of SDCachedURLResponse is allocated for encoding.
+ * To use it for decoding, the classForKeyedUnarchiver method is dynamically added to NSCachedURLResponse.
+ * Binary compatibility with previous versions of SDURLCache is thus preserved. Previous version of SDURLCache
+ * solved this bug by overriding NSCachedURLResponse NSCoding through category methods (it was a bad idea).
+ */
+@end
 
-@implementation NSCachedURLResponse(NSCoder)
+Class classForKeyedUnarchiver(id self, SEL _cmd) {
+    return [SDCachedURLResponse class];
+}
 
-// This is an intentional override of the default behavior. Silence the warning. (supported by Xcode 4.3 and above)
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wobjc-protocol-method-implementation"
+@implementation SDCachedURLResponse
 
 - (void)encodeWithCoder:(NSCoder *)coder {
     [coder encodeDataObject:self.data];
@@ -287,13 +297,12 @@ static NSDate *_parseHTTPDate(const char *buf, size_t bufLen) {
 }
 
 - (id)initWithCoder:(NSCoder *)coder {
-    return [self initWithResponse:[coder decodeObjectForKey:@"response"]
-                             data:[coder decodeDataObject]
-                         userInfo:[coder decodeObjectForKey:@"userInfo"]
-                    storagePolicy:[coder decodeIntForKey:@"storagePolicy"]];
+    NSData *data = [coder decodeDataObject];
+    NSURLResponse *response = [coder decodeObjectForKey:@"response"];
+    NSDictionary *userInfo = [coder decodeObjectForKey:@"userInfo"];
+    NSURLCacheStoragePolicy storagePolicy = [coder decodeIntForKey:@"storagePolicy"];
+    return [self initWithResponse:response data:data userInfo:userInfo storagePolicy:storagePolicy];
 }
-
-#pragma clang diagnostic pop
 
 @end
 
@@ -315,6 +324,17 @@ inline void dispatch_async_afreentrant(dispatch_queue_t queue, dispatch_block_t 
 @end
 
 @implementation SDURLCache
+
++ (void)initialize {
+    if (self != [SDURLCache class])
+        return;
+    
+    // This added classForKeyedUnarchiver method preserves binary compatibility with previous versions of SDURLCache
+    const char *typeEncoding = method_getTypeEncoding(class_getClassMethod([NSObject class], @selector(classForKeyedUnarchiver)));
+    BOOL added = class_addMethod(object_getClass([NSCachedURLResponse class]), @selector(classForKeyedUnarchiver), (IMP)classForKeyedUnarchiver, typeEncoding);
+    if (!added)
+        NSLog(@"ERROR: Could not add -[NSCachedURLResponse classForKeyedUnarchiver] method, crash ahead.");
+}
 
 #pragma mark SDURLCache (tools)
 
@@ -588,7 +608,8 @@ static dispatch_queue_t get_disk_io_queue() {
     [self createDiskCachePath];
     
     // Archive the cached response on disk
-    if (![NSKeyedArchiver archiveRootObject:cachedResponse toFile:cacheFilePath]) {
+    SDCachedURLResponse *archivableCachedResponse = [[SDCachedURLResponse alloc] initWithResponse:cachedResponse.response data:cachedResponse.data userInfo:cachedResponse.userInfo storagePolicy:cachedResponse.storagePolicy];
+    if (![NSKeyedArchiver archiveRootObject:archivableCachedResponse toFile:cacheFilePath]) {
         // Caching failed for some reason
         return;
     }
